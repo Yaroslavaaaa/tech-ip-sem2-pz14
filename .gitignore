@@ -1,0 +1,1 @@
+echo "deploy/tls/key.pem" >> .gitignore

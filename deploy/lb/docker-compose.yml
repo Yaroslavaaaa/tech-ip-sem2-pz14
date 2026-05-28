@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-db-lb
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=tasks_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - lb-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Реплика tasks 1
+  tasks_1:
+    build:
+      context: ../../
+      dockerfile: services/tasks/Dockerfile
+    container_name: tasks_1
+    environment:
+      - TASKS_PORT=8082
+      - AUTH_GRPC_ADDR=auth:50051
+      - DB_URL=postgres://postgres:postgres@postgres:5432/tasks_db?sslmode=disable
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - INSTANCE_ID=tasks-1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_started
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  # Реплика tasks 2
+  tasks_2:
+    build:
+      context: ../../
+      dockerfile: services/tasks/Dockerfile
+    container_name: tasks_2
+    environment:
+      - TASKS_PORT=8082
+      - AUTH_GRPC_ADDR=auth:50051
+      - DB_URL=postgres://postgres:postgres@postgres:5432/tasks_db?sslmode=disable
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - INSTANCE_ID=tasks-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_started
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  # Реплика tasks 3
+  tasks_3:
+    build:
+      context: ../../
+      dockerfile: services/tasks/Dockerfile
+    container_name: tasks_3
+    environment:
+      - TASKS_PORT=8082
+      - AUTH_GRPC_ADDR=auth:50051
+      - DB_URL=postgres://postgres:postgres@postgres:5432/tasks_db?sslmode=disable
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - INSTANCE_ID=tasks-3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_started
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  # Auth сервис 
+  auth:
+    build:
+      context: ../../
+      dockerfile: services/auth/Dockerfile
+    container_name: auth-service-lb
+    environment:
+      - AUTH_HTTP_PORT=8081
+      - AUTH_GRPC_PORT=50051
+      - APP_ENV=production
+      - LOG_LEVEL=info
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  # NGINX Load Balancer
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-lb
+    ports:
+      - "8080:8080"  
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - tasks_1
+      - tasks_2
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+networks:
+  lb-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

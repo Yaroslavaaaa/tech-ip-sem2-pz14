@@ -1,0 +1,125 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  REGISTRY: ghcr.io
+  TASKS_IMAGE: tasks-service
+  AUTH_IMAGE: auth-service
+  GO_VERSION: 1.24
+
+jobs:
+  # ========== 1. ТЕСТЫ И СБОРКА ==========
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      # Запуск тестов (если нет тестов, можно пропустить)
+      - name: Run tests
+        run: go test ./... -v
+        continue-on-error: true   # временно true, пока нет тестов
+
+      # Сборка auth (проверка компиляции)
+      - name: Build auth service
+        run: |
+          cd services/auth
+          go build -o /dev/null ./cmd/auth
+
+      # Сборка tasks (проверка компиляции)
+      - name: Build tasks service
+        run: |
+          cd services/tasks
+          go build -o /dev/null ./cmd/tasks
+
+  # ========== 2. СБОРКА И ПУБЛИКАЦИЯ DOCKER-ОБРАЗА ==========
+  docker-build:
+    name: Build and publish Docker image
+    runs-on: ubuntu-latest
+    needs: test
+    # Выполнять только для push в main/master (не для PR)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.CR_PAT }}
+
+      # Генерация короткого хеша коммита для тега
+      - name: Get commit hash
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # Сборка и публикация образа tasks
+      - name: Build and push tasks image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/tasks/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TASKS_IMAGE }}:${{ steps.vars.outputs.sha_short }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TASKS_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # (опционально) Сборка образа auth, если нужно
+      - name: Build and push auth image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/auth/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.AUTH_IMAGE }}:${{ steps.vars.outputs.sha_short }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.AUTH_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========== 3. ДЕПЛОЙ НА VPS (опциональный шаг) ==========
+  # deploy:
+  #   name: Deploy to VPS
+  #   runs-on: ubuntu-latest
+  #   needs: docker-build
+  #   if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+  #   steps:
+  #     - name: Deploy via SSH
+  #       uses: appleboy/ssh-action@v1.0.0
+  #       with:
+  #         host: ${{ secrets.VPS_HOST }}
+  #         username: ${{ secrets.VPS_USER }}
+  #         key: ${{ secrets.VPS_SSH_KEY }}
+  #         script: |
+  #           cd /opt/app
+  #           docker compose pull
+  #           docker compose up -d --force-recreate
