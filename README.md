@@ -1,315 +1,171 @@
 ## Практическая работа №14. Вуйко Ярослава, ЭФМО-01-25
-### Реализация очереди задач (producer–consumer): retries, DLQ, идемпотентность. 27.05.2026
+### Реализация очереди задач (producer–consumer): retries, DLQ, идемпотентность. 28.05.2026
 
 
+### Как поднят RabbitMQ и какие очереди созданы
 
-### Очереди и их параметры
+RabbitMQ поднят через Docker Compose. Используется образ `rabbitmq:3.13-management-alpine`, который включает встроенный веб-интерфейс для мониторинга.
 
-| Очередь | Тип | Durable | DLX параметры |
-|---------|-----|---------|---------------|
-| `task_jobs` | Основная | Да | `x-dead-letter-exchange: ""`, `x-dead-letter-routing-key: task_jobs_dlq` |
-| `task_jobs_dlq` | DLQ | Да | Нет |
+Порты:
+- `5672` — AMQP (для подключения приложений)
+- `15672` — Management UI (для администрирования)
 
+Созданные очереди:
+- `task_jobs` — основная очередь задач
+- `task_jobs_dlq` — (Dead Letter Queue
 
-### Формат сообщения (задачи)
+Очереди создаются автоматически при запуске worker'а с помощью функции `DeclareDLQSetup`. Основная очередь настраивается с параметром `x-dead-letter-routing-key`, который указывает на DLQ. Это означает, что сообщения, которые не удалось обработать, автоматически отправляются в DLQ.
+
+## Формат сообщения (JSON)
+
+Задача, отправляемая в очередь, имеет следующую структуру:
 
 ```json
 {
     "job": "process_task",
-    "task_id": "t_abc12345",
+    "task_id": "t_fail",
     "attempt": 1,
     "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"
 }
 ```
 
-### Описание полей
+Поля:
+- `job` — тип задачи (process_task)
+- `task_id` — идентификатор задачи в БД
+- `attempt` — номер текущей попытки обработки (начинается с 1)
+- `message_id` — уникальный UUID для идемпотентности
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `job` | string | Тип задачи (`process_task`) |
-| `task_id` | string | Идентификатор задачи в БД |
-| `attempt` | int | Номер попытки обработки (начинается с 1) |
-| `message_id` | string | Уникальный UUID для идемпотентности |
+### Где и как публикуется сообщение
 
----
+Сообщение публикуется сервисом `tasks` при вызове эндпоинта `/v1/jobs/process-task`. 
 
-### Producer: публикация задач
+Порядок публикации:
+1. Клиент отправляет POST-запрос с `task_id`
+2. Сервис проверяет существование задачи в БД
+3. Если задача существует, формируется `TaskJob` с `attempt=1` и новым `message_id`
+4. Сообщение публикуется в очередь `task_jobs`
 
-### 5.1. Эндпоинт для создания задачи
+### Как устроен worker и где делается ack
 
-```http
-POST /v1/jobs/process-task
-Authorization: Bearer demo-token
-Content-Type: application/json
+Worker — отдельный сервис, который запускается в контейнере и подписывается на очередь `task_jobs`.
 
-{
-    "task_id": "t_fail"
-}
+Логика обработки одного сообщения:
+
+<img width="2374" height="5183" alt="2026-05-28" src="https://github.com/user-attachments/assets/efbbaf6a-9b92-4e6c-a3d6-137da6d83912" />
+
+
+Где используется ack:
+- После успешной обработки: `delivery.Ack(false)`
+- После retry (публикации нового сообщения): `delivery.Ack(false)`
+- После отправки в DLQ: `delivery.Ack(false)`
+
+Ack означает: сообщение обработано (или перенаправлено), можно удалить из основной очереди. Если worker упадёт до ack, сообщение будет доставлено снова.
+
+### Демонстрация
+
+### Создание задачи
+<img width="1372" height="662" alt="image" src="https://github.com/user-attachments/assets/642ad505-2a96-47bb-bfb1-00e73f09ffba" />
+
+
+### Отправка задачи в очередь
+<img width="1384" height="655" alt="image" src="https://github.com/user-attachments/assets/45497a48-6e90-4746-ae93-b61160508efe" />
+
+
+### Отправка задачи в очередь(DLQ)
+<img width="1384" height="655" alt="image" src="https://github.com/user-attachments/assets/57042308-79c5-4904-b8a5-fb16c5ce7fe7" />
+
+
+
+### Логи worker'а
+
+Успешная обработка (обычная задача):
+```
+2026-05-28T09:21:15.708Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "4a6451e6-8149-4b8c-bbc0-46a7ecf81c61", "task_id": "t_4f6bbc99", "attempt": 1}
+2026-05-28T09:21:17.710Z        INFO    processor/processor.go:75       Job processed successfully      {"component": "processor", "job_id": "4a6451e6-8149-4b8c-bbc0-46a7ecf81c61", "task_id": "t_4f6bbc99"}
 ```
 
-### 5.2. Код публикации
-
-```go
-func (p *JobPublisher) PublishProcessTask(ctx context.Context, taskID string) error {
-    messageID := uuid.New().String()
-    
-    job := &rabbitmq.TaskJob{
-        Job:       "process_task",
-        TaskID:    taskID,
-        Attempt:   1,
-        MessageID: messageID,
-    }
-
-    return p.rabbitClient.PublishJob(ctx, p.queueName, job)
-}
+Retry и DLQ (задача t_fail):
+```
+2026-05-28T09:21:59.209Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 1}
+2026-05-28T09:22:01.211Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 1, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:01.212Z        DEBUG   rabbitmq/client.go:169  Job published   {"component": "rabbitmq", "queue": "task_jobs", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+2026-05-28T09:22:01.212Z        INFO    processor/processor.go:98       Job retried     {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "new_attempt": 2}
+2026-05-28T09:22:01.213Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 2}
+2026-05-28T09:22:03.214Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 2, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:03.214Z        DEBUG   rabbitmq/client.go:169  Job published   {"component": "rabbitmq", "queue": "task_jobs", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+2026-05-28T09:22:03.215Z        INFO    processor/processor.go:98       Job retried     {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "new_attempt": 3}
+2026-05-28T09:22:03.221Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 3}
+2026-05-28T09:22:05.223Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 3, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        WARN    processor/processor.go:107      Max attempts reached, sending to DLQ    {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempts": 3}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:107
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        WARN    rabbitmq/client.go:203  Publishing to DLQ       {"component": "rabbitmq", "dlq": "task_jobs_dlq", "reason": "max_attempts_exceeded", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+tech-ip-sem2/shared/rabbitmq.(*Client).PublishToDLQ
+        /app/shared/rabbitmq/client.go:203
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:111
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        INFO    rabbitmq/client.go:229  Message sent to DLQ     {"component": "rabbitmq", "dlq": "task_jobs_dlq"}
 ```
 
----
+После трёх неудачных попыток сообщение попадает в очередь `task_jobs_dlq`.
 
-## 6. Consumer: Worker с retry и DLQ
+### Демонстрация идемпотентности
 
-### 6.1. Создание очередей с DLQ
-
-```go
-func (c *Client) DeclareDLQSetup(mainQueue, dlqName string) error {
-    // Объявляем DLQ
-    if err := c.DeclareQueue(dlqName, true, ""); err != nil {
-        return err
-    }
-
-    // Объявляем основную очередь с DLX
-    if err := c.DeclareQueue(mainQueue, true, dlqName); err != nil {
-        return err
-    }
-    return nil
-}
-```
-
-### 6.2. Prefetch для контроля нагрузки
+В worker'е реализовано хранилище обработанных `message_id` (в памяти). При получении сообщения сначала проверяется, не обрабатывалось ли оно ранее. Это защищает от дублей при повторных доставках.
 
 ```go
-// Устанавливаем prefetch = 1 (одно сообщение за раз)
-client.SetPrefetch(1)
-```
-
-### 6.3. Алгоритм обработки сообщения
-
-```go
-func (p *TaskProcessor) ProcessJob(ctx context.Context, delivery amqp.Delivery) {
-    // 1. Парсим задачу
-    var job rabbitmq.TaskJob
-    json.Unmarshal(delivery.Body, &job)
-
-    // 2. Идемпотентность: проверяем, не обработано ли уже
-    if p.processedStore.IsProcessed(job.MessageID) {
-        delivery.Ack(false)
-        return
-    }
-
-    // 3. Выполняем работу
-    err := p.doWork(ctx, &job)
-
-    // 4. Обрабатываем результат
-    if err == nil {
-        p.processedStore.MarkProcessed(job.MessageID)
-        delivery.Ack(false)
-        return
-    }
-
-    // 5. Retry логика
-    if job.Attempt < p.config.MaxAttempts {
-        job.Attempt++
-        p.rabbitClient.PublishJob(ctx, p.config.QueueName, &job)
-        delivery.Ack(false) // подтверждаем исходное сообщение
-        return
-    }
-
-    // 6. Превышено число попыток → отправляем в DLQ
-    p.rabbitClient.PublishToDLQ(ctx, p.config.DLQName, delivery, "max_attempts_exceeded")
+if p.processedStore.IsProcessed(job.MessageID) {
+    p.logger.Warn("Duplicate message detected, skipping")
     delivery.Ack(false)
+    return
 }
 ```
 
-### 6.4. Симуляция ошибок (для демонстрации)
+### Итог
 
-```go
-func (p *TaskProcessor) doWork(ctx context.Context, job *rabbitmq.TaskJob) error {
-    // Имитация длительной обработки (2 секунды)
-    time.Sleep(2 * time.Second)
+В результате практического занятия реализована полностью рабочая очередь задач:
 
-    // Симуляция ошибки для task_id = "t_fail"
-    if job.TaskID == "t_fail" {
-        return fmt.Errorf("simulated processing error for task %s", job.TaskID)
-    }
+1. Созданы основная очередь task_jobs и очередь task_jobs_dlq с настройкой Dead Letter
+2. Эндпоинт /v1/jobs/process-task публикует задачи в JSON-формате
+3. Consumer (worker) читает очередь, обрабатывает задачи и отправляет ack
+4. При ошибке выполняется до 3 попыток с увеличением счётчика
+5. После 3 неудачных попыток сообщение отправляется в task_jobs_dlq
+6. Хранилище message_id предотвращает повторную обработку
 
-    return nil
-}
-```
 
----
+### Контрольные вопросы
 
-## 7. Идемпотентность
+1. Чем "job queue" отличается от "event queue"?
+Job queue предназначена для выполнения конкретной работы, требует подтверждения и может пересылаться при ошибке. Event queue — это уведомление о том, что что-то произошло, обработка обычно лёгкая и не требует retry.
 
-Для защиты от дублирования сообщений используется хранилище обработанных `message_id`:
+2. Почему система очередей часто работает как at-least-once?
+Потому что ack может не успеть до падения consumer'а. Брокер не знает, обработалось сообщение или нет, и доставляет его снова. Гарантировать exactly-once сложнее и дороже.
 
-```go
-type ProcessedStore struct {
-    mu        sync.RWMutex
-    processed map[string]bool
-}
+3. Как DLQ помогает эксплуатации?
+DLQ изолирует "плохие" сообщения, которые не получилось обработать. Они не блокируют основную очередь, их можно анализировать, исправлять ошибки и перезапускать вручную.
 
-func (s *ProcessedStore) IsProcessed(messageID string) bool {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    return s.processed[messageID]
-}
+4. Почему ретраи нельзя делать бесконечно?
+Бесконечные ретраи могут забить очередь, создавать бесконечную нагрузку на систему, маскировать реальные проблемы и откладывать ошибку, не давая понять, что что-то сломалось навсегда.
 
-func (s *ProcessedStore) MarkProcessed(messageID string) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.processed[messageID] = true
-}
-```
+5. Что такое идемпотентность и как её реализовать минимально?
+Идемпотентность — свойство операции, при котором повторное выполнение не меняет результат. Минимальная реализация: присвоить каждому сообщению уникальный `message_id` и хранить список уже обработанных ID, например в `map[string]bool`.
 
----
 
-## 8. Демонстрация работы
 
-### 8.1. Запуск системы
 
-```powershell
-cd deploy/tls
-docker-compose up --build -d
-```
-
-### 8.2. Создание задачи (успешная обработка)
-
-```powershell
-# Создаём задачу в БД
-docker exec -it postgres-db psql -U postgres -d tasks_db -c "
-INSERT INTO tasks (id, title, description, due_date, done, created_at, updated_at)
-VALUES ('t_4f6bbc99', 'Test task', 'Success', '2026-12-31', false, NOW(), NOW());
-"
-
-# Отправляем в очередь
-curl -k -X POST https://localhost:8443/v1/jobs/process-task `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer demo-token" `
-  -d '{\"task_id\":\"t_4f6bbc99\"}'
-```
-
-**Логи worker:**
-```
-INFO Processing job {"task_id": "t_4f6bbc99", "attempt": 1}
-INFO Job processed successfully
-```
-
-### 8.3. Создание задачи с ошибкой (retry и DLQ)
-
-```powershell
-curl -k -X POST https://localhost:8443/v1/jobs/process-task `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer demo-token" `
-  -d '{\"task_id\":\"t_fail\"}'
-```
-
-**Логи worker (попытка 1):**
-```
-INFO Processing job {"task_id": "t_fail", "attempt": 1}
-WARN Job processing failed {"error": "simulated processing error for task t_fail"}
-INFO Job retried {"new_attempt": 2}
-```
-
-**Логи worker (попытка 2):**
-```
-INFO Processing job {"task_id": "t_fail", "attempt": 2}
-WARN Job processing failed
-INFO Job retried {"new_attempt": 3}
-```
-
-**Логи worker (попытка 3 → DLQ):**
-```
-INFO Processing job {"task_id": "t_fail", "attempt": 3}
-WARN Job processing failed
-WARN Max attempts reached, sending to DLQ
-INFO Message sent to DLQ {"dlq": "task_jobs_dlq"}
-```
-
-### 8.4. Проверка DLQ
-
-```powershell
-# Проверка очереди DLQ через API
-curl -s -u guest:guest http://localhost:15672/api/queues/%2F/task_jobs_dlq | ConvertFrom-Json | Select-Object name, messages_ready
-```
-
-Результат:
-```
-name            messages_ready
-----            --------------
-task_jobs_dlq   1
-```
-
----
-
-## 9. Логи успешного запуска worker
-
-```
-INFO Worker configuration {"rabbit_url": "amqp://guest:guest@rabbitmq:5672/", "main_queue": "task_jobs", "dlq_name": "task_jobs_dlq", "max_attempts": 3}
-DEBUG Queue declared {"queue": "task_jobs_dlq", "args": {}}
-DEBUG Queue declared {"queue": "task_jobs", "args": {"x-dead-letter-exchange":"","x-dead-letter-routing-key":"task_jobs_dlq"}}
-INFO DLQ setup completed {"main_queue": "task_jobs", "dlq": "task_jobs_dlq"}
-INFO Queues declared successfully
-INFO Worker started. Waiting for jobs...
-```
-
----
-
-## 10. Скриншоты из RabbitMQ Management UI
-
-### 10.1. Очередь task_jobs с DLQ параметрами
-
-*На скриншоте видно: очередь `task_jobs` с параметром `x-dead-letter-routing-key: task_jobs_dlq`*
-
-### 10.2. Очередь task_jobs_dlq с сообщением
-
-*На скриншоте видно: 1 сообщение в DLQ после 3 неудачных попыток*
-
----
-
-## 11. Контрольные вопросы
-
-**1. Что такое DLQ и зачем она нужна?**
-
-DLQ (Dead Letter Queue) — очередь "мёртвых" сообщений, куда попадают сообщения, которые не удалось обработать после всех повторных попыток. Она нужна, чтобы не терять "плохие" сообщения и иметь возможность их проанализировать или вручную переобработать.
-
-**2. Как работает retry в вашей реализации?**
-
-При ошибке обработки увеличивается счётчик `attempt`. Если `attempt < max_attempts`, сообщение публикуется заново в основную очередь. Исходное сообщение подтверждается (ack), чтобы не зацикливаться. После достижения `max_attempts` сообщение отправляется в DLQ.
-
-**3. Что такое prefetch и почему он важен?**
-
-Prefetch ограничивает количество сообщений, которые consumer может получить до отправки ack. Он важен для контроля нагрузки: если обработка тяжёлая, prefetch=1 гарантирует, что worker не возьмёт больше сообщений, чем может обработать.
-
-**4. Как реализована идемпотентность?**
-
-Каждое сообщение имеет уникальный `message_id`. Worker хранит в памяти (map) уже обработанные ID. При получении сообщения проверяется, не обрабатывался ли уже этот ID. Если да — сообщение подтверждается, но работа не выполняется повторно.
-
-**5. Почему сообщение может быть доставлено повторно?**
-
-Из-за at-least-once доставки. Если worker упал после выполнения работы, но до отправки ack, брокер переотправит сообщение другому consumer'у. Идемпотентность защищает от дублирования в таких случаях.
-
----
-
-## 12. Вывод
-
-В результате практического занятия успешно реализована очередь задач с поддержкой:
-
-| Функция | Реализация |
-|---------|------------|
-| **Retries** | 3 попытки с логированием каждой |
-| **DLQ** | Очередь `task_jobs_dlq` для сообщений, не прошедших обработку |
-| **Prefetch** | `prefetch=1` для контроля нагрузки |
-| **Идемпотентность** | Хранилище обработанных `message_id` |
-| **Отказоустойчивость** | RabbitMQ с durable очередями |
-
-Система готова к использованию в production-сценариях с гарантированной доставкой и обработкой ошибок.
